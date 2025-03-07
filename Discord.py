@@ -75,6 +75,7 @@ ydl_opts = {
         'preferredquality': '192',
     }],
     'noplaylist': True,
+    'cookiefile': '/home/ubuntu/discord/cookies.txt',  # Указываем путь к cookies.txt
 }
 
 
