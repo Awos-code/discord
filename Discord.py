@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 import os
 import discord
-import random
 import asyncio
 import aiohttp
-import json
-from datetime import datetime
+import re
 from discord.ext import commands
 from yt_dlp import YoutubeDL
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 
 load_dotenv()
 
@@ -31,155 +27,164 @@ sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
 
 youtube = build('youtube', 'v3', developerKey=os.getenv('YOUTUBE_API_KEY'))
 
-# Глобальные переменные
 music_queue = []
 now_playing = None
-paused = False
-REQUEST_DELAY = (1.2, 2.8)
-COOKIES_FILE = 'cookies.txt'
 
-# Конфигурация Invidious
-INVIDIOUS_INSTANCES = [
-    'https://vid.puffyan.us',
-    'https://inv.riverside.rocks',
-    'https://yt.artemislena.eu'
-]
+# Конфигурация yt-dlp
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'extractaudio': True,
+    'audioformat': 'mp3',
+    'noplaylist': True,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+}
 
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36'
-]
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn -sn',
+}
 
-def get_ydl_config():
-    return {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': 192,
-        }],
-        'cookiefile': COOKIES_FILE,
-        'nocheckcertificate': True,
-        'ignoreerrors': True,
-        'quiet': True,
-        'no_warnings': True,
-        'source_address': '0.0.0.0',
-        'http_headers': {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.youtube.com/'
-        },
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android_embedded'],
-                'skip': ['hls', 'dash']
-            }
-        },
-        'overrides': {
-            'retries': 15,
-            'fragment_retries': 15
-        }
-    }
+class Track:
+    def __init__(self, url, title, duration, source):
+        self.url = url
+        self.title = title
+        self.duration = duration
+        self.source = source
 
-class PlayerControls(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(emoji="⏯", style=discord.ButtonStyle.grey)
-    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # ... (реализация кнопок как в предыдущих версиях) ...
-
-async def update_cookies():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    
-    driver = webdriver.Chrome(options=chrome_options)
+async def get_youtube_track(query: str) -> Track:
     try:
-        driver.get("https://www.youtube.com")
-        await asyncio.sleep(random.uniform(2.5, 4.5))
-        
-        cookies = driver.get_cookies()
-        with open(COOKIES_FILE, 'w') as f:
-            json.dump(cookies, f)
-        
-        print(f"[{datetime.now()}] Cookies успешно обновлены")
-    except Exception as e:
-        print(f"Ошибка обновления cookies: {str(e)}")
-    finally:
-        driver.quit()
-
-async def search_youtube(query: str):
-    try:
-        await asyncio.sleep(random.uniform(*REQUEST_DELAY))
-        search_response = youtube.search().list(
+        request = youtube.search().list(
             q=query,
-            part='id,snippet',
-            maxResults=1,
-            type='video'
-        ).execute()
+            part="snippet",
+            type="video",
+            maxResults=1
+        )
+        response = request.execute()
         
-        return f"https://youtu.be/{search_response['items'][0]['id']['videoId']}"
+        if not response['items']:
+            return None
+            
+        video_id = response['items'][0]['id']['videoId']
+        title = response['items'][0]['snippet']['title']
+        
+        with YoutubeDL(YTDL_OPTIONS) as ydl:
+            info = ydl.extract_info(f"https://youtu.be/{video_id}", download=False)
+            return Track(info['url'], title, info['duration'], 'YouTube')
+            
     except Exception as e:
-        print(f"Ошибка YouTube API: {str(e)}")
-        return await search_invidious(query)
-
-async def search_invidious(query: str):
-    instance = random.choice(INVIDIOUS_INSTANCES)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{instance}/api/v1/search",
-                params={'q': query},
-                headers={'User-Agent': random.choice(USER_AGENTS)},
-                timeout=7
-            ) as resp:
-                results = await resp.json()
-                return f"{instance}/watch?v={results[0]['videoId']}"
-    except Exception as e:
-        print(f"Ошибка Invidious: {str(e)}")
+        print(f"YouTube API Error: {e}")
         return None
 
-async def get_audio_info(url: str):
+async def get_spotify_track(url: str) -> Track:
     try:
-        with YoutubeDL(get_ydl_config()) as ydl:
+        if 'track' in url:
+            track = sp.track(url)
+            query = f"{track['name']} {track['artists'][0]['name']}"
+            return await get_youtube_track(query)
+            
+        elif 'playlist' in url:
+            results = sp.playlist_items(url)
+            tracks = []
+            for item in results['items']:
+                track = item['track']
+                query = f"{track['name']} {track['artists'][0]['name']}"
+                tracks.append(await get_youtube_track(query))
+            return tracks
+            
+    except Exception as e:
+        print(f"Spotify Error: {e}")
+        return None
+
+async def get_soundcloud_track(url: str) -> Track:
+    try:
+        with YoutubeDL(YTDL_OPTIONS) as ydl:
             info = ydl.extract_info(url, download=False)
-            return info.get('entries')[0] if 'entries' in info else info
+            return Track(info['url'], info['title'], info['duration'], 'SoundCloud')
     except Exception as e:
-        print(f"Ошибка yt-dlp: {str(e)}")
+        print(f"SoundCloud Error: {e}")
         return None
+
+async def process_query(query: str) -> Track:
+    # Определение источника
+    if 'youtube.com' in query or 'youtu.be' in query':
+        return await get_youtube_track(query)
+    elif 'spotify.com' in query:
+        return await get_spotify_track(query)
+    elif 'soundcloud.com' in query:
+        return await get_soundcloud_track(query)
+    else:
+        return await get_youtube_track(query)
 
 @bot.event
 async def on_ready():
-    if not os.path.exists(COOKIES_FILE):
-        await update_cookies()
-    
-    bot.loop.create_task(cron_job())
     print(f'Бот {bot.user.name} готов к работе!')
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
         name="музыку | !help"
     ))
 
-async def cron_job():
-    while True:
-        await update_cookies()
-        await asyncio.sleep(6 * 3600)  # Обновление каждые 6 часов
-
 @bot.command()
-@commands.cooldown(3, 60, commands.BucketType.user)
 async def play(ctx, *, query: str):
-    # ... (реализация команды play с обработкой Spotify и очередью) ...
+    global music_queue
+    
+    voice_client = ctx.guild.voice_client
+    if not voice_client:
+        if ctx.author.voice:
+            await ctx.author.voice.channel.connect()
+            voice_client = ctx.guild.voice_client
+        else:
+            return await ctx.send("Сначала подключитесь к голосовому каналу!")
+    
+    track = await process_query(query)
+    if not track:
+        return await ctx.send("Не удалось найти трек!")
+    
+    music_queue.append(track)
+    
+    if not voice_client.is_playing():
+        await play_next(ctx)
+    else:
+        await ctx.send(f"Добавлено в очередь: **{track.title}**")
+
+async def play_next(ctx):
+    global music_queue, now_playing
+    
+    if not music_queue:
+        return
+    
+    voice_client = ctx.guild.voice_client
+    if voice_client:
+        track = music_queue.pop(0)
+        now_playing = track
+        
+        voice_client.play(
+            discord.FFmpegPCMAudio(track.url, **FFMPEG_OPTIONS),
+            after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+        )
+        
+        await ctx.send(f"Сейчас играет: **{track.title}** ({track.source})")
 
 @bot.command()
-async def update(ctx):
-    """Принудительное обновление cookies"""
-    await update_cookies()
-    await ctx.send("🍪 Cookies успешно обновлены!")
+async def skip(ctx):
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+        await ctx.send("Трек пропущен!")
+    else:
+        await ctx.send("Нет активного воспроизведения!")
 
-# ... остальные команды (pause, resume, queue, skip, stop) ...
+@bot.command()
+async def stop(ctx):
+    voice_client = ctx.guild.voice_client
+    if voice_client:
+        await voice_client.disconnect()
+        music_queue.clear()
+        await ctx.send("Воспроизведение остановлено!")
+    else:
+        await ctx.send("Бот не подключен к голосовому каналу!")
 
 if __name__ == "__main__":
     bot.run(os.getenv('DISCORD_TOKEN'))
